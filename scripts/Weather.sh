@@ -1,4 +1,4 @@
-root_path_name=../data/
+root_path_name=./data/
 data_path_name=weather.csv
 model_id_name=weather
 data_name=weather

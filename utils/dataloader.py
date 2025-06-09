@@ -20,7 +20,7 @@ class CustomDataLoader:
         self.pred_len = pred_len
         self.feature_type = feature_type
         self.target = target
-        self.target_slice = slice(0, None)
+        self.target_slice = slice(0, None)  # 设置默认的 target_slice（标记取全部列）。
 
         self._read_data()
 
@@ -42,19 +42,19 @@ class CustomDataLoader:
             df = df_raw
         else:
             df = df_raw.set_index('date')
-        if self.feature_type == 'S':
+        if self.feature_type == 'S':    # 若是单变量模式 ('S')，只保留目标列。
             df = df[[self.target]]
-        elif self.feature_type == 'MS':
+        elif self.feature_type == 'MS':    # 若是多变量输入、单变量输出 ('MS')，记录目标列位置以便后续切片。
             target_idx = df.columns.get_loc(self.target)
             self.target_slice = slice(target_idx, target_idx + 1)
 
         # split train/valid/test
         n = len(df)
-        if self.data.stem.startswith('ETTm'):
+        if self.data.stem.startswith('ETTm'):   # 工业现场传感器记录的变压器温度和环境数据，15分钟级数据（Minutely）
             train_end = 12 * 30 * 24 * 4
             val_end = train_end + 4 * 30 * 24 * 4
             test_end = val_end + 4 * 30 * 24 * 4
-        elif self.data.stem.startswith('ETTh'):
+        elif self.data.stem.startswith('ETTh'):  # 工业现场传感器记录的变压器温度和环境数据，小时级数据（Hourly）
             train_end = 12 * 30 * 24
             val_end = train_end + 4 * 30 * 24
             test_end = val_end + 4 * 30 * 24
