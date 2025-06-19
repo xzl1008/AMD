@@ -131,28 +131,28 @@ class DDI(nn.Module):
         2. 如果 alpha 不为 0，则对每个窗口的特征维度再进行一次全连接映射，实现不同特征之间的交互；
         3. 返回的张量与输入形状一致，但内容已经经过时序和跨特征的混合处理。
     """
-    def __init__(self, input_shape, dropout=0.2, patch=12, alpha=0.0, layernorm=True):
+    def __init__(self, input_shape, dropout=0.2, patch=12, alpha=0.0, layernorm=True,
+                 top_k=3, n_hop=1, heads=4):
         super(DDI, self).__init__()
         # input_shape[0] = seq_len    input_shape[1] = feature_num
         self.input_shape = input_shape
-        if alpha > 0.0:    # 当 alpha 大于 0 时，构建一个两层的全连接块 fc_block。该块将每个时间窗口的特征维度映射到 ff_dim 维，再映射回原特征维度，并在中间使用 GELU 激活和 Dropout。
+        if alpha > 0.0:    # alpha 大于 0 时构建图神经网络相关模块
             self.ff_dim = 2 ** math.ceil(math.log2(self.input_shape[-1]))
-            """
-                math.log2(self.input_shape[-1]) 求其以 2 为底的对数，再通过 math.ceil 向上取整，得到一个整数。
-                最后 2 ** 该整数，得到的是不小于特征维度的最小 2 的整数次幂。
-                采用这种计算方式的常见目的包括：               
-                    保证维度至少与输入特征数相当，避免缩减表示能力；
-                    让维度是 2 的幂次，通常在 GPU 等硬件上更易于优化（例如内存对齐、向量化运算），同时也符合很多深度学习框架中常见的隐藏维度设计习惯。
-                因此，这一步的作用是得到一个既不小于原特征数、又是 2 的幂次的隐藏维度 ff_dim，用于后续的全连接块 fc_block。这样既保持了足够的表示能力，又可能在实际训练和推理时带来一定的效率优势。
-            """
-            self.fc_block = nn.Sequential(
-                nn.Linear(self.input_shape[-1], self.ff_dim),
+            if self.ff_dim % heads != 0:
+                self.ff_dim = heads * math.ceil(self.ff_dim / heads)
+            self.heads = heads
+            self.channel_embed = nn.Linear(1, self.ff_dim)
+            self.q_proj = nn.Linear(self.ff_dim, self.ff_dim)
+            self.k_proj = nn.Linear(self.ff_dim, self.ff_dim)
+            self.v_proj = nn.Linear(self.ff_dim, self.ff_dim)
+            self.msg_mlp = nn.Sequential(
+                nn.Linear(self.ff_dim, self.ff_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(self.ff_dim, self.input_shape[-1]),
-                nn.GELU(),
-                nn.Dropout(dropout),
+                nn.Linear(self.ff_dim, 1)
             )
+            self.top_k = top_k
+            self.n_hop = n_hop
 
         self.n_history = 1    # 固定为 1，表示每次聚合只参考前一个窗口
         self.alpha = alpha
@@ -195,8 +195,27 @@ class DDI(nn.Module):
                 tmp = self.norm2(torch.flatten(tmp, 1, -1)).reshape(tmp.shape)
                 tmp = torch.transpose(tmp, 1, 2)
                 # [batch_size, patch, feature_num]
-                tmp = self.fc_block(tmp)
-                tmp = torch.transpose(tmp, 1, 2)
+                bs, P, C = tmp.shape
+                gnn_out = []
+                head_dim = self.ff_dim // self.heads
+                for p in range(P):
+                    h = tmp[:, p, :].unsqueeze(-1)
+                    h = self.channel_embed(h)
+                    for _ in range(self.n_hop):
+                        q = self.q_proj(h).view(bs, C, self.heads, head_dim).transpose(1, 2)
+                        k = self.k_proj(h).view(bs, C, self.heads, head_dim).transpose(1, 2)
+                        v = self.v_proj(h).view(bs, C, self.heads, head_dim).transpose(1, 2)
+                        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+                        if self.top_k < C:
+                            topk_val, topk_idx = torch.topk(attn, self.top_k, dim=-1)
+                            mask = torch.zeros_like(attn)
+                            mask.scatter_(-1, topk_idx, 1.0)
+                            attn = attn.masked_fill(mask == 0, -1e9)
+                        attn = torch.softmax(attn, dim=-1)
+                        h = torch.matmul(attn, v).transpose(1, 2).contiguous().view(bs, C, self.ff_dim)
+                    z_new = self.msg_mlp(h).squeeze(-1)
+                    gnn_out.append(z_new.unsqueeze(1))
+                tmp = torch.cat(gnn_out, dim=1).transpose(1, 2)
             output[:, :, i: i + self.patch] = res + self.alpha * tmp       # 公式（6） 通道维度交互（如果alpha等于0则没有加通道维度交互
 
         # [batch_size, feature_num, seq_len]

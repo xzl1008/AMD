@@ -55,7 +55,10 @@ def main(args):
         alpha=args.alpha,
         target_slice=data_loader.target_slice,
         norm=args.norm,
-        layernorm=args.layernorm
+        layernorm=args.layernorm,
+        top_k=args.top_k,
+        n_hop=args.n_hop,
+        heads=args.heads,
     ).to(device)
 
     print(sum(p.numel() for p in model.parameters()))
@@ -246,6 +249,15 @@ def parse_args():
         type=int,
         default=2,
         help='scale of mix layer',
+    )
+    parser.add_argument(
+        '--top_k', type=int, default=3, help='top k neighbors for channel GNN'
+    )
+    parser.add_argument(
+        '--n_hop', type=int, default=1, help='number of message passing hops'
+    )
+    parser.add_argument(
+        '--heads', type=int, default=4, help='attention heads in channel GNN'
     )
     parser.add_argument(
         # 4 8 16
