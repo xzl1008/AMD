@@ -10,7 +10,8 @@ from models.tsmoe import AMS
 class AMD(nn.Module):
     """Implementation of AMD."""
 
-    def __init__(self, input_shape, pred_len, n_block, dropout, patch, k, c, alpha, target_slice, norm=True, layernorm=True):
+    def __init__(self, input_shape, pred_len, n_block, dropout, patch, k, c, alpha,
+                 target_slice, norm=True, layernorm=True, top_k=3, n_hop=1, heads=4):
         """AMD模型的初始化函数
             Parameters
             ----------
@@ -85,8 +86,19 @@ class AMD(nn.Module):
 
         self.pastmixing = MDM(input_shape, k=k, c=c, layernorm=layernorm)
 
-        self.fc_blocks = nn.ModuleList([DDI(input_shape, dropout=dropout, patch=patch, alpha=alpha, layernorm=layernorm)
-                                        for _ in range(n_block)])
+        self.fc_blocks = nn.ModuleList([
+            DDI(
+                input_shape,
+                dropout=dropout,
+                patch=patch,
+                alpha=alpha,
+                layernorm=layernorm,
+                top_k=top_k,
+                n_hop=n_hop,
+                heads=heads,
+            )
+            for _ in range(n_block)
+        ])
 
         self.moe = AMS(input_shape, pred_len, ff_dim=2048, dropout=dropout, num_experts=8, top_k=2)
 
