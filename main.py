@@ -3,6 +3,8 @@ import argparse
 import os
 from pathlib import Path
 import sys
+from AutomaticWeightedLoss import AutomaticWeightedLoss
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # main root directory
@@ -23,7 +25,7 @@ from models.tsAMD import AMD
 
 def main(args):
     # select device
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.cuda if torch.cuda.is_available() else "cpu")
     # workers
     torch.set_num_threads(4)
     # set seed
@@ -61,10 +63,11 @@ def main(args):
     print(sum(p.numel() for p in model.parameters()))
 
     # set criterion and optimizer
-    criterion = torch.nn.MSELoss()   # 损失函数
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-9)   # 优化器
+    criterion = torch.nn.MSELoss()  # 损失函数
+    awl = AutomaticWeightedLoss(3)   # 动态平衡总loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-9)  # 优化器
 
-    best_loss = torch.tensor(float('inf'))    # 最佳损失初始为无穷大
+    best_loss = torch.tensor(float('inf'))  # 最佳损失初始为无穷大
     # create checkpoint directory
     save_directory = os.path.join(args.checkpoint_dir, args.name)
     #  生成用于保存模型的目录 save_directory，若该目录已存在则在其名称后追加递增编号以避免覆盖。
@@ -74,7 +77,7 @@ def main(args):
 
         path = Path(save_directory)
         dirs = glob.glob(f"{path}*")  # similar paths
-        matches = [re.search(rf"%s(\d+)" % path.stem, d) for d in dirs]
+        matches = [re.search(rf"%s(\d+)" % path.stem, d) for d in dirs]  #
         i = [int(m.groups()[0]) for m in matches if m]  # indices
         n = max(i) + 1 if i else 2  # increment number
         save_directory = f"{path}{n}"  # update path
@@ -82,30 +85,34 @@ def main(args):
     os.makedirs(save_directory)
 
     # start training
-    for epoch in range(args.train_epochs):     # 遍历训练轮次
-        model.train()     # 模型设为训练模式并初始化指标
+    for epoch in range(args.train_epochs):  # 遍历训练轮次
+        model.train()  # 模型设为训练模式并初始化指标
         train_mloss = torch.zeros(1, device=device)
         iter_time = 0
         print(f"epoch : {epoch + 1}")
         print("Train")
         pbar = tqdm(enumerate(train_data), total=len(train_data))
-        for i, (batch_x, batch_y) in pbar:       # 遍历每个batch
+        for i, (batch_x, batch_y) in pbar:  # 遍历每个batch
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             start_time = time.time()
-            outputs, moe_loss = model(batch_x)    # 前向传播得到输出与辅助损失 moe_loss
+            # outputs, moe_loss = model(batch_x)  # 前向传播得到输出与辅助损失 moe_loss
+            outputs, selector_loss, entropy_loss = model(batch_x)  # 前向传播得到输出与辅助损失 selector_loss和entropy_loss
             optimizer.zero_grad()
-            loss = criterion(outputs, batch_y) + moe_loss    # 计算总损失，公式（11）
-            loss.backward()      # 反向传播
-            optimizer.step()     # 更新参数
+            # loss = criterion(outputs, batch_y) + moe_loss  # 计算总损失，公式（11）
+            loss = awl(criterion(outputs, batch_y), selector_loss, entropy_loss)  # 计算总损失，公式（11）
+            loss.backward()  # 反向传播
+            optimizer.step()  # 更新参数
             end_time = time.time()
-            train_mloss = (train_mloss * i + loss.detach()) / (i + 1)      # 计算平均损失
-            pbar.set_description(('%-10s' * 1 + '%-10.8g ' * 1) % (f'{epoch + 1}/{args.train_epochs}', train_mloss))
+            train_mloss = (train_mloss * i + loss.detach()) / (i + 1)  # 计算平均损失
+            pbar.set_description(args.name + "  " + ('%-10s' * 1 + '%-10.8g ' * 1) % (f'{epoch + 1}/{args.train_epochs}', train_mloss))
             iteration_time = (end_time - start_time) * 1000
-            iter_time = (iter_time * i + iteration_time) / (i + 1)     # 记录每次迭代耗时
+            iter_time = (iter_time * i + iteration_time) / (i + 1)  # 记录每次迭代耗时
             # end batch -------------------------------------------------------------
+
+        print(args.data.split('/')[-1].split('.')[0])
         print(f"train loss: {train_mloss.item()}, iter_time: {iter_time}")
 
-        model.eval()   # 切换到评估模式并初始化指标
+        model.eval()  # 切换到评估模式并初始化指标
         val_mloss = torch.zeros(1, device=device)
         val_mae = torch.zeros(1, device=device)
         val_mse = torch.zeros(1, device=device)
@@ -113,9 +120,10 @@ def main(args):
         pbar = tqdm(enumerate(val_data), total=len(val_data))
 
         with torch.no_grad():
-            for i, (batch_x, batch_y) in pbar:     # 遍历验证集，每个 batch 计算损失及 MAE、MSE 等指标
+            for i, (batch_x, batch_y) in pbar:  # 遍历验证集，每个 batch 计算损失及 MAE、MSE 等指标
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs, moe_loss = model(batch_x)
+                # outputs, moe_loss = model(batch_x)
+                outputs, selector_loss, entropy_loss = model(batch_x)
                 loss = criterion(outputs, batch_y)
                 val_mloss = (val_mloss * i + loss.detach()) / (i + 1)
                 mae = torch.abs(outputs - batch_y).mean()
@@ -131,6 +139,7 @@ def main(args):
                 torch.save(best_model, os.path.join(save_directory, "best.pt"))
 
         # 打印本轮验证结果
+        print(args.data.split('/')[-1].split('.')[0])
         print(f"val loss: {val_mloss.item()}, val MSE: {val_mse.item()}, val MAE: {val_mae.item()}")
 
         # scheduler.step()
@@ -147,13 +156,14 @@ def main(args):
     test_mae = torch.zeros(1, device=device)
     test_mse = torch.zeros(1, device=device)
 
-    print("Final Test")
+    print(args.data.split('/')[-1].split('.')[0], "Final Test")
     pbar = tqdm(enumerate(test_data), total=len(test_data))
 
     with torch.no_grad():
-        for i, (batch_x, batch_y) in pbar:    # 在测试集上评估模型并计算损失、MAE 与 MSE
+        for i, (batch_x, batch_y) in pbar:  # 在测试集上评估模型并计算损失、MAE 与 MSE
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            outputs, moe_loss = model(batch_x)
+            # outputs, moe_loss = model(batch_x)
+            outputs, selector_loss, entropy_loss = model(batch_x)
             loss = criterion(outputs, batch_y)
             test_mloss = (test_mloss * i + loss.detach()) / (i + 1)
             mae = torch.abs(outputs - batch_y).mean()
@@ -163,6 +173,17 @@ def main(args):
             pbar.set_description(('%-10.8g' * 1) % (test_mloss))
     # 最终打印测试集结果
     print(f"test loss: {test_mloss.item()}, test MSE: {test_mse.item()}, test MAE: {test_mae.item()}")
+
+    #  将结果保存到result.csv
+    print("Writing to", args.result_path)
+    import pandas as pd
+    if os.path.exists(args.result_path):
+        df = pd.read_csv(args.result_path)
+    else:
+        df = pd.DataFrame(columns=['name', 'seq_len', 'pred_len', 'loss', 'MSE', 'MAE'])
+    df.loc[len(df)] = [args.data.split('/')[-1].split('.')[0], args.seq_len, args.pred_len, test_mloss.item(),
+                       test_mse.item(), test_mae.item()]
+    df.to_csv(args.result_path, index=False)
 
 
 def infer_extension(dataset_name):
@@ -180,6 +201,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     # basic config
     parser.add_argument('--seed', type=int, default=2024, help='random seed')
+    parser.add_argument(
+        '--cuda', type=str, default='cuda:0', help='cuda device'
+    )
     # data loader
     parser.add_argument('--data',
                         type=str,

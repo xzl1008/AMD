@@ -179,3 +179,97 @@ class AMS(nn.Module):
         # [batch_size, feature_num, seq_len]
 
         return output, loss     # 这个loss为公式（11）中的Loss Selector
+
+
+class AMSE(nn.Module):     # 在总损失中加入熵正则的AMS模型
+    def __init__(self, input_shape, pred_len, ff_dim=2048, dropout=0.2, loss_coef=1.0, entropy_coef=1.0,
+                 num_experts=4, top_k=2, entropy_eps=1e-8):
+        """
+        AMS模型的初始化函数
+            Parameters
+            ----------
+            input_shape：输入序列的形状，格式为 (seq_len, feature_num)，其中 seq_len 表示历史序列长度，feature_num 表示特征数量。
+            pred_len：预测的时间步长度，即模型最终要输出多少步的结果。
+            ff_dim：每个 Expert 网络内部前馈层的隐藏维度，默认 2048。在构建 Expert 时作为 hidden_dim 传入。
+            dropout：Expert 网络中 Dropout 的概率，默认 0.2。
+            loss_coef：控制门控负载均衡损失的权重。在前向传播中，该系数乘以 cv_squared(importance) 累加到 loss 上，用于鼓励专家使用更加均衡。
+            entropy_coef：熵正则项的权重 λ3，用于鼓励选择结果更稀疏明确。
+            num_experts：专家网络数量，默认为 4。对应 self.num_experts，并在构建 nn.ModuleList 时生成相应个数的 Expert 模块。
+            top_k：TopKGating 选择的专家个数。TopKGating 根据时间信息为每个批次选择 top_k 个专家参与预测，并保证 top_k <= num_experts。
+        """
+        super(AMSE, self).__init__()
+        # input_shape[0] = seq_len    input_shape[1] = feature_num
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.pred_len = pred_len
+
+        self.gating = TopKGating(input_shape[0], num_experts, top_k)
+
+        self.experts = nn.ModuleList(
+            [Expert(input_shape[0], pred_len, hidden_dim=ff_dim, dropout=dropout) for _ in range(num_experts)])
+        self.loss_coef = loss_coef
+        self.entropy_coef = entropy_coef
+        self.entropy_eps = entropy_eps
+        assert (self.top_k <= self.num_experts)
+
+    def cv_squared(self, x):
+        eps = 1e-10
+        # if only num_experts = 1
+        if x.shape[0] == 1:
+            return torch.tensor([0], device=x.device, dtype=x.dtype)
+        return x.float().var() / (x.float().mean() ** 2 + eps)
+
+    def forward(self, x, time_embedding):
+        # [batch_size, feature_num, seq_len]
+        batch_size = x.shape[0]
+        feature_num = x.shape[1]
+        # [batch_size, feature_num, seq_len] -> [feature_num, batch_size, seq_len]
+        x = torch.transpose(x, 0, 1)
+        # [batch_size, feature_num, seq_len] -> [feature_num, batch_size, seq_len]
+        time_embedding = torch.transpose(time_embedding, 0, 1)
+        """
+            将输入x和时间嵌入time_embedding从 [batch, feature, seq] 转置为 [feature, batch, seq]，便于逐特征处理。
+        """
+        output = torch.zeros(feature_num, batch_size, self.pred_len).to(x.device)
+        selector_loss = 0
+        entropy_loss = 0
+
+        for i in range(feature_num):  # 遍历每个特征
+            input = x[i]  # 取出第i个feature对应的历史输入。
+            time_info = time_embedding[i]  # 取出第i个feature的时间信息。
+            # x[i]  [batch_size, seq_len]
+            gates = self.gating(time_info)  # 计算 gating 权重。
+
+            #entropy_loss += (-gates * torch.log(gates + self.entropy_eps)).sum(dim=1).mean()  # 计算熵正则
+
+            # expert_outputs [batch_size, num_experts, pred_len]
+            # 更正：expert_outputs [num_experts, batch_size, pred_len]
+            expert_outputs = torch.zeros(self.num_experts, batch_size, self.pred_len).to(x.device)
+
+            for j in range(self.num_experts):  # 收集所有专家对该特征的预测结果。
+                expert_outputs[j, :, :] = self.experts[j](input)
+            # expert_outputs [batch_size, num_experts, pred_len]
+            expert_outputs = torch.transpose(expert_outputs, 0, 1)
+            # gates [batch_size, seq_len] -> [batch_size, num_experts, pred_len]
+            gates = gates.unsqueeze(-1).expand(-1, -1, self.pred_len)  # 扩展 gating 权重到预测长度
+            """
+                unsqueeze(dim)：在指定维度插入一个新的维度（大小为 1）。dim=-1 表示最后一个维度。
+                expand(*sizes)：将张量的特定维度扩展为更大的尺寸。-1 表示保持当前维度不变。self.pred_len 是预测长度，即需要将最后一维扩展为该长度。
+            """
+            # batch_output [batch_size, pred_len]
+            batch_output = (gates * expert_outputs).sum(1)  # 在维度1，即num_experts维度求和。公式（9）多预测器加权输出。
+            # gating与专家结果相乘后求和得到最终预测
+            output[i, :, :] = batch_output
+
+            importance = gates.sum(0)  # 计算各专家的重要度
+            selector_loss += self.loss_coef * self.cv_squared(importance)  # 累积负载均衡损失。
+
+
+            importance1 = gates.mean(0)
+            entropy_loss += (-importance1 * torch.log(importance1 + self.entropy_eps)).mean()  # 计算熵正则
+
+        # [feature_num, batch_size, seq_len]
+        output = torch.transpose(output, 0, 1)
+        # [batch_size, feature_num, seq_len]
+        # total_loss = selector_loss + self.entropy_coef * entropy_loss
+        return output, selector_loss, entropy_loss  # 这个loss为公式（11）中的Loss Selector，加了熵正则

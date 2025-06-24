@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 from models.common import RevIN
-from models.common import DDI
-from models.common import MDM
-from models.tsmoe import AMS
+from models.common import DDI, GNNDI, GNN_ATT_DDI, CAFI
+from models.common import MDM, MDMF
+from models.tsmoe import AMS, AMSE
 
 
 class AMD(nn.Module):
@@ -66,8 +66,10 @@ class AMD(nn.Module):
 
             Attributes
             ----------
-            pastmixing : MDM
-                多尺度分解模块的实例
+            # pastmixing : MDM
+            #     多尺度分解模块的实例
+            pastmixing : MDMF
+                频域增强的多尺度分解模块实例
 
             fc_blocks : nn.ModuleList
                 包含n_block个DDI模块的列表
@@ -83,13 +85,34 @@ class AMD(nn.Module):
         if self.norm:
             self.rev_norm = RevIN(input_shape[-1])
 
-        self.pastmixing = MDM(input_shape, k=k, c=c, layernorm=layernorm)
+            ###### 第一部分  #####
+            # self.pastmixing = MDM(input_shape, k=k, c=c, layernorm=layernorm)  # 去掉频域
+            self.pastmixing = MDMF(input_shape, patch=patch, k=k, c=c, layernorm=layernorm)    # 加上频域
 
-        self.fc_blocks = nn.ModuleList([DDI(input_shape, dropout=dropout, patch=patch, alpha=alpha, layernorm=layernorm)
-                                        for _ in range(n_block)])
+            ###### 第二部分   #####
+            # self.fc_blocks = nn.ModuleList([DDI(input_shape, dropout=dropout, patch=patch, alpha=alpha, layernorm=layernorm) for _ in range(n_block)])  # 利用时间维交互和通
+            self.fc_blocks = nn.ModuleList([CAFI(input_shape, dropout=dropout, patch=patch, rank=2, layernorm=layernorm) for _ in range(n_block)])  # 利用CAFI
+            # self.fc_blocks = nn.ModuleList([GNNDI(input_shape, dropout=dropout, patch=patch, alpha=alpha, layernorm=layernorm, top_k=21) for _ in range(n_block)])  # 基于图神经网络的通道依赖建模模块
 
-        self.moe = AMS(input_shape, pred_len, ff_dim=2048, dropout=dropout, num_experts=8, top_k=2)
+            """
+            self.fc_blocks = nn.ModuleList([
+                GNN_ATT_DDI(
+                    input_shape,
+                    dropout=dropout,
+                    patch=patch,
+                    alpha=alpha,
+                    layernorm=layernorm,
+                    top_k=21,
+                    n_hop=3,
+                    heads=4,
+                )
+                for _ in range(n_block)
+            ])     # 基于图神经网络和注意力机制的通道依赖建模模块
+            """
 
+            ###### 第三部分  #####
+            # self.moe = AMS(input_shape, pred_len, ff_dim=2048, dropout=dropout, num_experts=8, top_k=2)  # 去掉熵正则
+            self.moe = AMSE(input_shape, pred_len, ff_dim=2048, dropout=dropout, num_experts=8, top_k=2, entropy_coef=0.1)   # 加上熵正则
     def forward(self, x):
         # [batch_size, seq_len, feature_num]
 
@@ -108,7 +131,8 @@ class AMD(nn.Module):
             x = fc_block(x)
 
         # MOE
-        x, moe_loss = self.moe(x, time_embedding)  # seq_len -> pred_len
+        # x, moe_loss = self.moe(x, time_embedding)  # seq_len -> pred_len 未加熵正则
+        x, selector_loss, entropy_loss = self.moe(x, time_embedding)  # seq_len -> pred_len 加熵正则，更换总损失函数未动态调整，而非直接相加
 
         # [batch_size, feature_num, pred_len]
         x = torch.transpose(x, 1, 2)
@@ -121,4 +145,5 @@ class AMD(nn.Module):
         if self.target_slice:
             x = x[:, :, self.target_slice]
 
-        return x, moe_loss
+        # return x, moe_loss       # 未加熵正则
+        return x, selector_loss, entropy_loss   # 更换总损失函数未动态调整，而非直接相加
